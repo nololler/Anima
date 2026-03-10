@@ -1,17 +1,29 @@
+"""
+Anima — FastAPI Application
+============================
+Wiring order:
+  1. Config loaded
+  2. AppState container built (single source of truth for all live objects)
+  3. Tools registered against AppState references
+  4. TickEngine wired to AppState
+  5. WebSocket and REST handlers read from AppState
+
+All mutable global state lives in AppState. No bare module-level globals
+except the single `state` instance and the FastAPI `app`.
+"""
 import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-from pathlib import Path
 
 from backend.config import get_config, reload_config
 from backend.core.message_bus import get_bus
 from backend.core.tick import get_tick_engine
-from backend.core.persona import PersonaAssembler
 from backend.core.prompter import Prompter
 from backend.core.conversation import ConversationHandler
 from backend.memory.banks import get_bank_manager
@@ -21,52 +33,74 @@ from backend.users.manager import get_user_manager
 from backend.connectors.discord import DiscordConnector
 
 
-# ── Global state ──────────────────────────────────────────────────────────────
+# ── AppState ──────────────────────────────────────────────────────────────────
 
-persona_state: dict = {
-    "name": "Anima",
-    "mood": "neutral",
-    "mood_intensity": 5,
-    "tick_count": 0,
-    "bank": "default",
-    "context_pressure": 0.0,
-    "user_is_active": False,
-    "setup_complete": False,
-}
+class AppState:
+    """
+    Single container for all live application objects.
+    Passed by reference so bank-switch rebuilds are reflected everywhere.
+    """
+    def __init__(self):
+        cfg = get_config()
+        self.persona: dict = {
+            "name": cfg.anima.name,
+            "mood": "neutral",
+            "mood_intensity": 5,
+            "tick_count": 0,
+            "bank": cfg.anima.active_memory_bank,
+            "context_pressure": 0.0,
+            "entity_state": "idle",
+            "user_is_active": False,
+            "setup_complete": False,
+        }
 
-context_manager = ContextManager()
-bank_manager = get_bank_manager()
-memory_manager = bank_manager.get_manager()
-persona_assembler = PersonaAssembler(memory_manager, persona_state)
-prompter = Prompter(memory_manager, persona_assembler, persona_state)
-conversation_handler = ConversationHandler(context_manager, persona_assembler, persona_state)
+        self.bank_manager = get_bank_manager()
+        self.context = ContextManager()
 
-# Wire tools
-setup_tools(memory_manager, context_manager, get_bus(), persona_state)
+        # These three get rebuilt on bank switch
+        self.memory = self.bank_manager.get_manager()
+        self.prompter = Prompter(self.memory, self.context, self.persona)
+        self.conversation = ConversationHandler(self.context, self.memory, self.persona)
 
+    def rebuild_for_bank(self, bank_name: str):
+        """Rebuild memory-dependent objects after a bank switch."""
+        self.persona["bank"] = bank_name
+        self.memory = self.bank_manager.get_manager()
+        self.prompter = Prompter(self.memory, self.context, self.persona)
+        self.conversation = ConversationHandler(self.context, self.memory, self.persona)
+        # Re-wire tools with new memory manager
+        setup_tools(self.memory, self.context, get_bus(), self.persona)
+        # Re-wire tick engine
+        tick = get_tick_engine()
+        tick.setup(self.prompter, self.conversation, self.context, self.persona)
+
+
+# Singleton AppState
+state = AppState()
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cfg = get_config()
-    persona_state["name"] = cfg.anima.name
-    persona_state["bank"] = cfg.anima.active_memory_bank
-
-    # Setup is complete if the config name has been changed from default
-    # AND the self.md has real content (not the stub)
-    self_content = await memory_manager.read_self()
-    has_real_identity = (
-        len(self_content.strip()) > 50 and
-        "No identity configured yet" not in self_content and
-        "Not yet defined" not in self_content
+    # Setup complete check
+    self_content = await state.memory.read_self()
+    state.persona["setup_complete"] = (
+        len(self_content.strip()) > 50
+        and "No identity configured yet" not in self_content
+        and "Not yet defined" not in self_content
     )
-    persona_state["setup_complete"] = has_real_identity
 
-    # Start tick engine
+    # Register tools
+    setup_tools(state.memory, state.context, get_bus(), state.persona)
+
+    # Wire and start tick engine
     tick = get_tick_engine()
-    tick.setup(prompter, conversation_handler, context_manager, persona_state)
+    tick.setup(state.prompter, state.conversation, state.context, state.persona)
     tick.start()
 
-    # Start Discord connector (stub)
+    # Discord stub
+    cfg = get_config()
     discord = DiscordConnector(cfg.connectors.discord)
     asyncio.create_task(discord.start())
 
@@ -74,6 +108,8 @@ async def lifespan(app: FastAPI):
 
     tick.stop()
 
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Anima", lifespan=lifespan)
 
@@ -94,32 +130,30 @@ async def websocket_endpoint(ws: WebSocket):
     bus = get_bus()
     await bus.connect(ws)
     try:
-        # Send initial state
         await ws.send_text(json.dumps({
             "type": "init",
             "data": {
-                "persona": persona_state,
+                "persona": state.persona,
                 "tick_status": get_tick_engine().get_status(),
-                "banks": bank_manager.list_banks(),
-                "messages": [m.model_dump() for m in context_manager.get_all_messages()],
-                "setup_complete": persona_state["setup_complete"],
+                "banks": state.bank_manager.list_banks(),
+                "messages": [m.model_dump() for m in state.context.get_all_messages()],
+                "setup_complete": state.persona["setup_complete"],
             },
         }))
-
         while True:
             raw = await ws.receive_text()
             data = json.loads(raw)
-            await handle_ws_message(data, ws)
+            await _handle_ws(data, ws)
 
     except WebSocketDisconnect:
         bus.disconnect(ws)
-        persona_state["user_is_active"] = False
+        state.persona["user_is_active"] = False
     except Exception as e:
         bus.disconnect(ws)
-        persona_state["user_is_active"] = False
+        state.persona["user_is_active"] = False
 
 
-async def handle_ws_message(data: dict, ws: WebSocket):
+async def _handle_ws(data: dict, ws: WebSocket):
     bus = get_bus()
     msg_type = data.get("type")
 
@@ -127,37 +161,34 @@ async def handle_ws_message(data: dict, ws: WebSocket):
         content = data.get("content", "").strip()
         if not content:
             return
+
         user_id = data.get("user_id", "user")
         username = data.get("username", "User")
 
-        persona_state["user_is_active"] = True
-        persona_state["last_message_time"] = datetime.now()
+        # Update tick engine state
+        get_tick_engine().record_user_message()
 
+        # Ensure user profile exists
         user_mgr = get_user_manager()
         user_mgr.get_or_create_session(user_id, username)
-        user_profile = await user_mgr.ensure_profile(username, memory_manager)
+        user_profile = await user_mgr.ensure_profile(username, state.memory)
 
-        # Run prompter (active mode)
-        recent_msgs = context_manager.get_messages_for_llm()
-        prompter_result = await prompter.run_active(recent_msgs, content)
+        # Build a lightweight prompter status for active messages
+        # (not a full tick — just context pressure info)
+        pressure = state.context.estimate_pressure()
+        injected = state.context.get_injected_paths()
+        prompter_status = (
+            f"Context: {pressure:.0%} full. "
+            f"Injected memories: {injected if injected else 'none'}."
+        )
 
-        # Handle conversation
-        await conversation_handler.handle_user_message(
+        await state.conversation.handle_user_message(
             content=content,
-            user_id=user_id,
             username=username,
-            prompter_result=prompter_result,
             user_profile=user_profile,
+            prompter_status=prompter_status,
         )
-
         user_mgr.record_message(user_id)
-
-        # Post pass — only title the day if we have enough messages
-        recent = context_manager.get_messages_for_llm()
-        await prompter.run_post(
-            day_title_needed=len(recent) >= 4,
-            recent_messages=recent,
-        )
 
     elif msg_type == "ping":
         await ws.send_text(json.dumps({"type": "pong"}))
@@ -168,23 +199,23 @@ async def handle_ws_message(data: dict, ws: WebSocket):
 @app.get("/api/status")
 async def get_status():
     return {
-        "persona": persona_state,
+        "persona": state.persona,
         "tick": get_tick_engine().get_status(),
-        "banks": bank_manager.list_banks(),
-        "active_bank": bank_manager.current_bank(),
-        "context_pressure": context_manager.estimate_pressure(),
-        "message_count": len(context_manager.get_all_messages()),
+        "banks": state.bank_manager.list_banks(),
+        "active_bank": state.bank_manager.current_bank(),
+        "context": state.context.message_count(),
+        "context_pressure": state.context.estimate_pressure(),
     }
 
 
 @app.get("/api/memory/list")
 async def list_memory(folder: str = ""):
-    return memory_manager.list_files(folder)
+    return state.memory.list_files(folder)
 
 
 @app.get("/api/memory/read")
 async def read_memory(path: str):
-    content = await memory_manager.read(path)
+    content = await state.memory.read(path)
     if content is None:
         raise HTTPException(status_code=404, detail="File not found")
     return {"path": path, "content": content}
@@ -192,15 +223,21 @@ async def read_memory(path: str):
 
 @app.get("/api/diary")
 async def read_diary(date: Optional[str] = None):
-    content = await memory_manager.read_diary(date)
+    content = await state.memory.read_diary(date)
     return {"date": date, "content": content}
 
 
 @app.get("/api/diary/list")
 async def list_diary():
-    entries = memory_manager.list_files("diary")
-    return entries
+    return state.memory.list_files("diary")
 
+
+@app.get("/api/config")
+async def get_full_config():
+    return get_config().model_dump()
+
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
 
 class SetupPayload(BaseModel):
     name: str
@@ -233,58 +270,59 @@ async def setup(payload: SetupPayload):
     cfg.tick.interval_minutes = payload.tick_interval
     cfg.save()
 
-    await memory_manager.write("static/self.md", f"# {payload.name}\n\n{payload.identity}\n")
-    persona_state["name"] = payload.name
-    persona_state["setup_complete"] = True
+    await state.memory.write("static/self.md", f"# {payload.name}\n\n{payload.identity}\n")
+    state.persona["name"] = payload.name
+    state.persona["setup_complete"] = True
 
-    conversation_handler.invalidate_adapter()
-    prompter._invalidate_adapter()
+    state.conversation.invalidate_adapter()
+    state.prompter.invalidate_adapter()
 
     await get_bus().broadcast("setup_complete", {"name": payload.name})
     return {"success": True}
 
 
-class BankSwitchPayload(BaseModel):
+# ── Bank management ───────────────────────────────────────────────────────────
+
+class BankPayload(BaseModel):
     bank_name: str
 
 
 @app.post("/api/bank/switch")
-async def switch_bank(payload: BankSwitchPayload):
+async def switch_bank(payload: BankPayload):
     async def summarize(msgs):
-        prompt = await persona_assembler.build_summarizer_prompt(msgs)
         from backend.llm import create_adapter, Message
+        from backend.core.conversation import build_system_prompt
         adapter = create_adapter(get_config().main_llm)
-        resp = await adapter.complete([Message(role="user", content=prompt)], max_tokens=300)
+        lines = [f"[{m['role']}]: {m['content'][:300]}" for m in msgs]
+        prompt = (
+            "Summarize this conversation in 2-3 paragraphs. "
+            "First person, emotional tone, capture what matters.\n\n"
+            + "\n".join(lines)
+        )
+        resp = await adapter.complete(
+            [Message(role="user", content=prompt)], max_tokens=400
+        )
         return resp.content
 
-    history = context_manager.get_messages_for_llm()
-    result = await bank_manager.switch_bank(payload.bank_name, history, summarize)
+    history = state.context.get_messages_for_llm()
+    result = await state.bank_manager.switch_bank(payload.bank_name, history, summarize)
 
-    # Reset context and reload memory
-    context_manager.clear()
-    global memory_manager, persona_assembler, prompter, conversation_handler
-    memory_manager = bank_manager.get_manager()
-    persona_state["bank"] = payload.bank_name
-    persona_assembler = PersonaAssembler(memory_manager, persona_state)
-    prompter = Prompter(memory_manager, persona_assembler, persona_state)
-    conversation_handler = ConversationHandler(context_manager, persona_assembler, persona_state)
-    setup_tools(memory_manager, context_manager, get_bus(), persona_state)
+    state.context.clear()
+    state.rebuild_for_bank(payload.bank_name)
 
     await get_bus().emit_bank_switch(result["old_bank"], result["new_bank"])
     return result
 
 
 @app.post("/api/bank/create")
-async def create_bank(payload: BankSwitchPayload):
-    success = bank_manager.create_bank(payload.bank_name)
+async def create_bank(payload: BankPayload):
+    success = state.bank_manager.create_bank(payload.bank_name)
     return {"success": success, "bank": payload.bank_name}
 
 
 @app.get("/api/banks")
 async def list_banks():
-    return {"banks": bank_manager.list_banks(), "active": bank_manager.current_bank()}
-
-@app.get("/api/config")
-async def get_full_config():
-    cfg = get_config()
-    return cfg.model_dump()
+    return {
+        "banks": state.bank_manager.list_banks(),
+        "active": state.bank_manager.current_bank(),
+    }
