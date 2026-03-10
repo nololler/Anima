@@ -1,0 +1,39 @@
+anima:
+  name: "Anima"
+  active_memory_bank: "default"
+  version: "0.1.0"
+
+main_llm:
+  provider: "ollama"          # ollama | openai | anthropic | openai_compatible
+  model: "qwen2.5:7b"
+  base_url: "http://localhost:11434"
+  api_key: ""                 # for openai / anthropic / openai_compatible
+  temperature: 0.8
+  context_limit: 8192
+  vision: false               # set true for VLM models
+
+prompter_llm:
+  provider: "ollama"
+  model: "qwen2.5:3b"
+  base_url: "http://localhost:11434"
+  api_key: ""
+  temperature: 1.1
+  context_limit: 2048
+
+tick:
+  interval_minutes: 1
+  enabled: true
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:5173"
+    - "http://localhost:3000"
+
+connectors:
+  discord:
+    enabled: false
+    token: ""
+    guild_id: ""
+    channel_ids: []

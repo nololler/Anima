@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: #07080a;
+  color: #c8d0e0;
+  font-family: 'DM Sans', sans-serif;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #4a5366; }
+
+.panel-border {
+  border: 1px solid #1e2229;
+  border-radius: 6px;
+  background: #13161b;
+}
+
+.thought-glow { box-shadow: 0 0 12px rgba(176, 124, 245, 0.12); }
+.kernel-glow { box-shadow: 0 0 12px rgba(74, 158, 138, 0.12); }
+.accent-glow { box-shadow: 0 0 12px rgba(124, 158, 245, 0.15); }
+
+.culled-message {
+  opacity: 0.3;
+  text-decoration: line-through;
+  filter: grayscale(0.8);
+}
+
+.ai-initiated-message {
+  border-left: 2px solid #f5c842;
+}
+
+.streaming-cursor::after {
+  content: '▋';
+  animation: blink 1s step-end infinite;
+  color: #7c9ef5;
+}
