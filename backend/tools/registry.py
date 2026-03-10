@@ -1,6 +1,19 @@
+"""
+Tool Registry
+=============
+Two tool sets:
+  Main LLM tools — full autonomous capability
+  Prompter tools — handled internally in prompter.py (no LLM tool-calling for 0.5B)
+
+The Prompter does NOT use LLM tool-calling. It receives structured JSON
+and executes actions directly in Python. This avoids reliability issues
+with a 0.5B model trying to format tool calls.
+"""
+
 import json
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Callable, Optional
 from backend.llm.base import ToolDefinition
+from backend.memory.context import ContextMessage
 
 _handlers: Dict[str, Callable] = {}
 _definitions: Dict[str, ToolDefinition] = {}
@@ -11,42 +24,37 @@ def register_tool(definition: ToolDefinition, handler: Callable):
     _handlers[definition.name] = handler
 
 
-def get_all_definitions() -> List[ToolDefinition]:
-    return list(_definitions.values())
-
-
 def get_main_llm_tools() -> List[ToolDefinition]:
-    main_tools = [
+    names = [
         "read_memory", "write_memory", "append_memory", "list_memory", "search_memory",
         "write_diary", "read_diary",
+        "write_day_entry", "read_day",
         "update_person", "read_person",
-        "update_self", "set_mood",
-        "initiate_conversation", "set_tick_interval",
+        "read_image_manifest",
+        "update_self",
+        "set_mood",
+        "report_state",
+        "initiate_message",
+        "set_tick_interval",
     ]
-    return [_definitions[n] for n in main_tools if n in _definitions]
-
-
-def get_prompter_tools() -> List[ToolDefinition]:
-    prompter_tools = [
-        "read_memory", "list_memory", "search_memory",
-        "append_memory", "write_memory",
-        "write_diary", "update_person", "set_mood",
-    ]
-    return [_definitions[n] for n in prompter_tools if n in _definitions]
+    return [_definitions[n] for n in names if n in _definitions]
 
 
 async def execute_tool(name: str, args: Dict[str, Any]) -> Any:
     if name not in _handlers:
         return {"error": f"Unknown tool: {name}"}
     try:
-        result = await _handlers[name](**args)
-        return result
+        return await _handlers[name](**args)
     except Exception as e:
         import traceback
         return {"error": str(e), "trace": traceback.format_exc()[-400:]}
 
 
-def setup_tools(memory_manager, context_manager, bus, persona_state):
+def setup_tools(memory_manager, context_manager, bus, persona_state, tick_engine_ref=None):
+    """
+    Register all Main LLM tools.
+    tick_engine_ref is a callable that returns the tick engine (to avoid circular import).
+    """
 
     # ── Memory ────────────────────────────────────────────────────────
 
@@ -72,31 +80,37 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
 
     register_tool(ToolDefinition(
         name="read_memory",
-        description="Read a file from long-term memory by path (e.g. 'static/favorites.md', 'people/Alice.md')",
+        description="Read any file from your memory bank by relative path (e.g. 'static/self.md', 'people/Alice.md').",
         parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     ), read_memory)
 
     register_tool(ToolDefinition(
         name="write_memory",
-        description="Create or overwrite a memory file.",
-        parameters={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+        description="Create or overwrite a file in your memory bank. Use .md extension. Do not use for diary or day files.",
+        parameters={"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["path", "content"]},
     ), write_memory)
 
     register_tool(ToolDefinition(
         name="append_memory",
         description="Append content to an existing memory file.",
-        parameters={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+        parameters={"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["path", "content"]},
     ), append_memory)
 
     register_tool(ToolDefinition(
         name="list_memory",
-        description="List files and folders in a memory directory. Leave folder empty for root.",
+        description="List files and folders in your memory bank. Leave folder empty for root listing.",
         parameters={"type": "object", "properties": {"folder": {"type": "string"}}, "required": []},
     ), list_memory)
 
     register_tool(ToolDefinition(
         name="search_memory",
-        description="Search across all memory files by keyword.",
+        description="Full-text search across all memory files.",
         parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
     ), search_memory)
 
@@ -113,7 +127,7 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
 
     register_tool(ToolDefinition(
         name="write_diary",
-        description="Write an entry in your personal diary for today.",
+        description="Write a personal diary entry for today. Timestamped automatically.",
         parameters={"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]},
     ), write_diary)
 
@@ -122,6 +136,35 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
         description="Read diary entries. Specify date as YYYY-MM-DD or omit for today.",
         parameters={"type": "object", "properties": {"date": {"type": "string"}}, "required": []},
     ), read_diary)
+
+    # ── Days (date-gated) ─────────────────────────────────────────────
+
+    async def write_day_entry(content: str, title: Optional[str] = None):
+        result = await memory_manager.write_day_entry(content, title)
+        await bus.emit_memory_update(result["path"], result["action"])
+        return result
+
+    async def read_day(date: str = None):
+        result = await memory_manager.read_day(date)
+        return result if result is not None else {"error": f"No day file for {date or 'today'}"}
+
+    register_tool(ToolDefinition(
+        name="write_day_entry",
+        description=(
+            "Log an entry to today's day file. Creates new file if it's a new day (with optional title). "
+            "Appends if file exists. ONLY works for today — cannot write past or future dates."
+        ),
+        parameters={"type": "object", "properties": {
+            "content": {"type": "string"},
+            "title": {"type": "string", "description": "Title for new day file (first entry only)"},
+        }, "required": ["content"]},
+    ), write_day_entry)
+
+    register_tool(ToolDefinition(
+        name="read_day",
+        description="Read a day log. Specify date as YYYY-MM-DD or omit for today.",
+        parameters={"type": "object", "properties": {"date": {"type": "string"}}, "required": []},
+    ), read_day)
 
     # ── People ────────────────────────────────────────────────────────
 
@@ -136,15 +179,29 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
 
     register_tool(ToolDefinition(
         name="update_person",
-        description="Create or update a profile for a person you know.",
-        parameters={"type": "object", "properties": {"name": {"type": "string"}, "content": {"type": "string"}}, "required": ["name", "content"]},
+        description="Create or update a memory profile for a person. Use when meeting someone new or learning something worth remembering about them.",
+        parameters={"type": "object", "properties": {
+            "name": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["name", "content"]},
     ), update_person)
 
     register_tool(ToolDefinition(
         name="read_person",
-        description="Read a person's profile by name.",
+        description="Read a person's memory profile by name.",
         parameters={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
     ), read_person)
+
+    # ── Images ────────────────────────────────────────────────────────
+
+    async def read_image_manifest():
+        return await memory_manager.read_image_manifest()
+
+    register_tool(ToolDefinition(
+        name="read_image_manifest",
+        description="Read the manifest of all images saved in memory. Shows names, dates, descriptions, and who sent them.",
+        parameters={"type": "object", "properties": {}, "required": []},
+    ), read_image_manifest)
 
     # ── Self ──────────────────────────────────────────────────────────
 
@@ -164,7 +221,7 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
 
     register_tool(ToolDefinition(
         name="update_self",
-        description="Update your own identity file. Append new reflections or overwrite entirely.",
+        description="Update your own identity file (static/self.md). Append reflections or overwrite entirely.",
         parameters={"type": "object", "properties": {
             "content": {"type": "string"},
             "mode": {"type": "string", "enum": ["overwrite", "append"]},
@@ -173,46 +230,73 @@ def setup_tools(memory_manager, context_manager, bus, persona_state):
 
     register_tool(ToolDefinition(
         name="set_mood",
-        description="Update your current mood and intensity (1-10).",
+        description="Update your displayed mood and intensity (1-10).",
         parameters={"type": "object", "properties": {
             "mood": {"type": "string"},
             "intensity": {"type": "integer", "minimum": 1, "maximum": 10},
         }, "required": ["mood", "intensity"]},
     ), set_mood)
 
-    # ── Conversation ──────────────────────────────────────────────────
+    # ── State report ──────────────────────────────────────────────────
 
-    async def initiate_conversation(message: str, urgency: str = "low"):
-        from backend.memory.context import ContextMessage
+    async def report_state(mood: str, energy: str, note: str = ""):
+        context_manager.update_state_report({"mood": mood, "energy": energy, "note": note})
+        persona_state["mood"] = mood
+        await bus.emit_mood_update(mood, persona_state.get("mood_intensity", 5))
+        await bus.emit_inner_thought(
+            f"[state] mood={mood} energy={energy} — {note}", kind="kernel"
+        )
+        return {"success": True}
+
+    register_tool(ToolDefinition(
+        name="report_state",
+        description=(
+            "Record your current inner state for your subconscious kernel. "
+            "Call this at the end of idle reflection. "
+            "The kernel reads this every tick to understand how you're doing."
+        ),
+        parameters={"type": "object", "properties": {
+            "mood": {"type": "string", "description": "Current mood in one word"},
+            "energy": {"type": "string", "enum": ["low", "medium", "high"]},
+            "note": {"type": "string", "description": "One sentence about your current state"},
+        }, "required": ["mood", "energy"]},
+    ), report_state)
+
+    # ── Conversation initiation ───────────────────────────────────────
+
+    async def initiate_message(message: str):
         msg = ContextMessage.create(role="assistant", content=message, ai_initiated=True)
         context_manager.add_message(msg)
         await bus.emit_chat_message(
             role="assistant", content=message, msg_id=msg.id, ai_initiated=True
         )
-        return {"sent": True, "urgency": urgency}
+        return {"sent": True}
 
     register_tool(ToolDefinition(
-        name="initiate_conversation",
+        name="initiate_message",
         description="Send a message to the user on your own initiative without being prompted. Use when you genuinely want to reach out.",
         parameters={"type": "object", "properties": {
             "message": {"type": "string"},
-            "urgency": {"type": "string", "enum": ["low", "medium", "high"]},
         }, "required": ["message"]},
-    ), initiate_conversation)
+    ), initiate_message)
 
     # ── System ────────────────────────────────────────────────────────
 
     async def set_tick_interval(minutes: int):
         from backend.config import get_config
-        from backend.core.tick import get_tick_engine
         cfg = get_config()
         cfg.tick.interval_minutes = max(1, min(60, minutes))
         cfg.save()
-        get_tick_engine().reschedule(cfg.tick.interval_minutes)
+        if tick_engine_ref:
+            engine = tick_engine_ref()
+            if engine:
+                engine.reschedule(cfg.tick.interval_minutes)
         return {"interval_minutes": cfg.tick.interval_minutes}
 
     register_tool(ToolDefinition(
         name="set_tick_interval",
         description="Change how often your internal tick fires, in minutes (1-60).",
-        parameters={"type": "object", "properties": {"minutes": {"type": "integer", "minimum": 1, "maximum": 60}}, "required": ["minutes"]},
+        parameters={"type": "object", "properties": {
+            "minutes": {"type": "integer", "minimum": 1, "maximum": 60},
+        }, "required": ["minutes"]},
     ), set_tick_interval)
