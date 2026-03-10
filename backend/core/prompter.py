@@ -1,20 +1,43 @@
+"""
+Prompter — Subconscious Kernel (0.5B model)
+============================================
+Runs every 60s. Strictly mechanical — no personality, no prose.
+Does NOT use LLM tool-calling. Produces JSON → executes actions in Python.
+
+Output schema (strict):
+{
+  "inject_paths": [],       # memory paths to inject, max 3
+  "cull_ids": [],           # message IDs to cull directly
+  "nudges": [{"priority": "high|medium|low", "text": "..."}],  # max 3
+  "note": "..."             # one sentence for Main LLM, max 80 chars
+}
+"""
 import json
 import re
-from typing import Optional, Dict, List
+from typing import Optional, List, Dict
+from datetime import datetime
+
 from backend.llm import create_adapter, Message
 from backend.config import get_config
 from backend.core.message_bus import get_bus
+from backend.memory.manager import MemoryManager
+from backend.memory.context import ContextManager
+
+
+PROMPTER_SCHEMA = '{"inject_paths":[],"cull_ids":[],"nudges":[{"priority":"high|medium|low","text":"..."}],"note":"..."}'
+
+SYSTEM_PROMPT = (
+    "You are a mechanical scheduler. "
+    "Output ONLY valid JSON. No prose. No explanation. No markdown. "
+    "Start with { and end with }. "
+    "Follow the schema exactly."
+)
 
 
 class Prompter:
-    """
-    The subconscious kernel. Runs before Main LLM on every tick and message.
-    Handles: memory selection, context pressure, inner thoughts, kernel reports.
-    """
-
-    def __init__(self, memory_manager, persona_assembler, persona_state: dict):
+    def __init__(self, memory_manager: MemoryManager, context_manager: ContextManager, persona_state: dict):
         self.memory = memory_manager
-        self.assembler = persona_assembler
+        self.context = context_manager
         self.state = persona_state
         self._adapter = None
 
@@ -24,217 +47,159 @@ class Prompter:
             self._adapter = create_adapter(cfg.prompter_llm)
         return self._adapter
 
-    def _invalidate_adapter(self):
+    def invalidate_adapter(self):
         self._adapter = None
 
-    async def _call(self, prompt: str, system: str = None) -> str:
+    async def _call(self, prompt: str) -> str:
         adapter = self._get_adapter()
         try:
             response = await adapter.complete(
                 messages=[Message(role="user", content=prompt)],
-                system=system,
-                max_tokens=512,
+                system=SYSTEM_PROMPT,
+                max_tokens=300,
             )
-            return response.content.strip()
+            return (response.content or "").strip()
         except Exception as e:
-            return json.dumps({
-                "kernel_report": f"Prompter error: {e}",
-                "inner_thought": "Something feels off in my mind...",
-            })
+            return json.dumps({"inject_paths": [], "cull_ids": [], "nudges": [], "note": f"error:{str(e)[:40]}"})
 
-    def _parse_json(self, text: str) -> dict:
-        """
-        Multi-strategy JSON extraction. Small models often wrap JSON in prose,
-        add preamble, or produce slightly malformed output. We try every trick.
-        """
-        if not text:
-            return self._fallback(text)
+    def _parse(self, raw: str) -> dict:
+        """Strict parse with complete fallback. Never raises."""
+        default = {"inject_paths": [], "cull_ids": [], "nudges": [], "note": ""}
+        if not raw:
+            return default
 
-        # Strategy 1: direct parse after stripping fences
-        clean = re.sub(r"```(?:json)?|```", "", text).strip()
+        clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+
+        # Try direct parse
         try:
-            return json.loads(clean)
+            data = json.loads(clean)
         except json.JSONDecodeError:
-            pass
-
-        # Strategy 2: find first { ... } block (greedy, handles trailing prose)
-        match = re.search(r"\{[\s\S]*\}", clean)
-        if match:
+            m = re.search(r"\{[\s\S]*\}", clean)
+            if not m:
+                return default
+            candidate = re.sub(r",\s*([}\]])", r"\1", m.group())
             try:
-                return json.loads(match.group())
+                data = json.loads(candidate)
             except json.JSONDecodeError:
-                # Strategy 3: fix common small-model JSON mistakes
-                candidate = match.group()
-                # Remove trailing commas before } or ]
-                candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
-                # Replace single quotes with double quotes
-                candidate = re.sub(r"(?<![\\])'", '"', candidate)
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    pass
+                return default
 
-        # Strategy 4: extract fields manually with regex
         result = {}
-        for field in ["kernel_report", "inner_thought", "suggested_message"]:
-            # Match "field": "value" or "field": null
-            m = re.search(
-                rf'"{field}"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|null)',
-                clean, re.DOTALL
-            )
-            if m:
-                result[field] = m.group(1) if m.group(1) is not None else None
+        # inject_paths: list[str], max 3
+        paths = data.get("inject_paths", [])
+        result["inject_paths"] = [str(p) for p in (paths if isinstance(paths, list) else [])][:3]
+        # cull_ids: list[str]
+        cids = data.get("cull_ids", [])
+        result["cull_ids"] = [str(c) for c in (cids if isinstance(cids, list) else [])]
+        # nudges: list[{priority, text}], max 3
+        nudges_raw = data.get("nudges", [])
+        nudges = []
+        for n in (nudges_raw if isinstance(nudges_raw, list) else [])[:3]:
+            if isinstance(n, dict) and "text" in n:
+                pri = n.get("priority", "low")
+                nudges.append({"priority": pri if pri in ("high", "medium", "low") else "low", "text": str(n["text"])[:120]})
+        result["nudges"] = nudges
+        result["note"] = str(data.get("note", ""))[:80]
+        return result
 
-        suggest_m = re.search(r'"suggest_initiate"\s*:\s*(true|false)', clean)
-        if suggest_m:
-            result["suggest_initiate"] = suggest_m.group(1) == "true"
+    def _build_prompt(self, mode: str, cull_candidates: List[Dict], memory_index: str, recent_messages: List[Dict]) -> str:
+        now = datetime.now()
+        pressure = self.context.estimate_pressure()
+        state_summary = self.context.get_state_summary()
+        action_log = self.context.get_prompter_log_summary()
+        active_count = len(self.context.get_active_messages())
+        total_count = len(self.context.get_all_messages())
 
-        paths_m = re.search(r'"relevant_memory_paths"\s*:\s*(\[.*?\])', clean, re.DOTALL)
-        if paths_m:
-            try:
-                result["relevant_memory_paths"] = json.loads(paths_m.group(1))
-            except Exception:
-                result["relevant_memory_paths"] = []
+        recent_lines = []
+        for m in recent_messages[-4:]:
+            content = str(m.get("content", ""))[:100].replace("\n", " ")
+            recent_lines.append(f"[{m.get('role','?')[:8]}]: {content}")
 
-        if result.get("kernel_report") or result.get("inner_thought"):
-            return result
+        cull_lines = [f"  id={c['id'][:8]}... score={c['score']} role={c['role']} preview={c['preview'][:40]}" for c in cull_candidates[:6]]
 
-        # Strategy 5: treat the whole response as an inner thought
-        return self._fallback(clean)
+        return f"""DATE: {now.strftime("%Y-%m-%d")}
+TIME: {now.strftime("%H:%M")}
+MODE: {mode}
+CONTEXT: {active_count}/{total_count} msgs pressure={pressure:.0%}
+MAIN_STATE: {state_summary}
+LAST_ACTIONS: {action_log}
 
-    def _fallback(self, text: str) -> dict:
-        """Last resort — treat raw text as inner thought."""
-        clean = text.strip()[:300] if text else "..."
+RECENT:
+{chr(10).join(recent_lines) or "(none)"}
+
+MEMORY_FILES:
+{memory_index[:400] or "(empty)"}
+
+CULL_CANDIDATES (low score=safe to cull):
+{chr(10).join(cull_lines) or "  none"}
+
+SCHEMA: {PROMPTER_SCHEMA}
+
+RULES:
+- inject_paths: only from MEMORY_FILES, max 3
+- cull_ids: only from CULL_CANDIDATES IDs, only if pressure>0.6 or total>20
+- nudges: max 3, only if needed
+- note: max 80 chars
+
+OUTPUT ONLY JSON:"""
+
+    async def run_tick(self, mode: str) -> dict:
+        """Run one prompter tick. Returns packet for Main LLM."""
+        bus = get_bus()
+        recent_msgs = self.context.get_messages_for_llm()
+        cull_candidates = self.context.get_cull_candidates(n=8)
+        memory_index = await self._get_memory_index()
+
+        prompt = self._build_prompt(mode, cull_candidates, memory_index, recent_msgs)
+        raw = await self._call(prompt)
+        result = self._parse(raw)
+
+        # Execute: inject memories
+        injected = []
+        for path in result["inject_paths"]:
+            content = await self.memory.read(path)
+            if content:
+                self.context.inject_memory(path, content)
+                self.context.log_prompter_action("inject", path)
+                injected.append(path)
+                await bus.emit_inner_thought(f"[kernel] injected: {path}", kind="kernel")
+
+        # Execute: cull messages directly
+        culled_ids = []
+        if result["cull_ids"]:
+            valid_ids = {c["id"] for c in cull_candidates}
+            safe_ids = [cid for cid in result["cull_ids"] if cid in valid_ids]
+            if safe_ids:
+                self.context.cull_messages(safe_ids)
+                self.context.log_prompter_action("cull", f"{len(safe_ids)}")
+                culled_ids = safe_ids
+                await bus.emit_context_cull(safe_ids)
+                await bus.emit_inner_thought(f"[kernel] culled {len(safe_ids)} messages", kind="kernel")
+
+        if result["note"]:
+            await bus.emit_inner_thought(f"[kernel] {result['note']}", kind="kernel")
+
+        self.context.log_prompter_action("tick", mode)
+
         return {
-            "kernel_report": "Kernel scan complete.",
-            "inner_thought": clean,
-            "suggest_initiate": False,
-            "suggested_message": None,
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": mode,
+            "context_pressure": round(self.context.estimate_pressure(), 2),
+            "active_messages": len(self.context.get_active_messages()),
+            "main_llm_state": self.context.get_state_summary(),
+            "injected_memories": injected,
+            "culled_message_count": len(culled_ids),
+            "nudges": result["nudges"],
+            "note": result["note"],
         }
 
-    async def run_idle(self, recent_messages: List[Dict]) -> dict:
-        """Full idle tick: kernel + reflection + optional initiation suggestion."""
-        bus = get_bus()
-        tick_count = self.state.get("tick_count", 0)
-
-        system = (
-            "You are an AI's inner voice and subconscious kernel. "
-            "You MUST respond with ONLY a valid JSON object — no prose, no explanation, no markdown. "
-            "Start your response with { and end with }. Nothing else."
-        )
-
-        prompt = await self.assembler.build_prompter_prompt(
-            recent_messages=recent_messages,
-            tick_count=tick_count,
-            mode="idle",
-        )
-
-        raw = await self._call(prompt, system=system)
-        result = self._parse_json(raw)
-
-        kernel_report = result.get("kernel_report", "")
-        inner_thought = result.get("inner_thought", "")
-        suggest_initiate = result.get("suggest_initiate", False)
-        suggested_message = result.get("suggested_message", None)
-
-        if kernel_report:
-            await bus.emit_inner_thought(kernel_report, kind="kernel")
-        if inner_thought:
-            await bus.emit_inner_thought(inner_thought, kind="thought")
-
-        context_pressure = self.state.get("context_pressure", 0.0)
-        if context_pressure > 0.75:
-            cull_note = f"Context at {context_pressure:.0%} — flagging for culling."
-            await bus.emit_inner_thought(cull_note, kind="kernel")
-            result["suggest_cull"] = True
-        else:
-            result["suggest_cull"] = False
-
-        result["kernel_report"] = kernel_report
-        result["inner_thought"] = inner_thought
-        result["suggest_initiate"] = suggest_initiate
-        result["suggested_message"] = suggested_message
-
-        return result
-
-    async def run_active(self, recent_messages: List[Dict], incoming_message: str) -> dict:
-        """Pre-response pass: fast memory selection + nudge."""
-        bus = get_bus()
-        tick_count = self.state.get("tick_count", 0)
-
-        system = (
-            "You are an AI's inner voice and subconscious kernel. "
-            "You MUST respond with ONLY a valid JSON object — no prose, no explanation, no markdown. "
-            "Start your response with { and end with }. Nothing else."
-        )
-
-        prompt = await self.assembler.build_prompter_prompt(
-            recent_messages=recent_messages,
-            tick_count=tick_count,
-            mode="active",
-        )
-
-        raw = await self._call(prompt, system=system)
-        result = self._parse_json(raw)
-
-        kernel_report = result.get("kernel_report", "")
-        inner_thought = result.get("inner_thought", "")
-        relevant_paths = result.get("relevant_memory_paths", [])
-        if not isinstance(relevant_paths, list):
-            relevant_paths = []
-
-        if kernel_report:
-            await bus.emit_inner_thought(kernel_report, kind="kernel")
-        if inner_thought:
-            await bus.emit_inner_thought(inner_thought, kind="thought")
-
-        # Load relevant memory files
-        injected_memories = []
-        for path in relevant_paths[:3]:
-            if isinstance(path, str):
-                content = await self.memory.read(path)
-                if content:
-                    injected_memories.append(f"### {path}\n{content[:800]}")
-
-        result["injected_memories"] = injected_memories
-        result["kernel_report"] = kernel_report
-        result["inner_thought"] = inner_thought
-
-        return result
-
-    async def run_post(self, day_title_needed: bool, recent_messages: List[Dict]) -> None:
-        """Post-response housekeeping: day titling. Only fires once per calendar day."""
-        bus = get_bus()
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        already_titled = self.state.get("day_titled_date") == today
-
-        if day_title_needed and recent_messages and not already_titled:
-            try:
-                recent_text = " ".join(
-                    m.get("content", "")[:100] for m in recent_messages[-4:]
-                )
-                title_prompt = (
-                    f"Give this conversation a short poetic title, 3-6 words, no quotes, "
-                    f"no punctuation, just the title itself:\n\n{recent_text}"
-                )
-                raw = await self._call(title_prompt)
-                # Strip any quotes, punctuation, keep only the title line
-                title = raw.strip().split("\n")[0]
-                title = re.sub(r'["\'/\\:*?<>|]', "", title).strip()[:60]
-                if not title:
-                    title = "Untitled"
-                today = datetime.now().strftime("%Y-%m-%d")
-                safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_")
-                path = f"days/{today}_{safe_title}.md"
-                summary = "\n".join(
-                    f"[{m.get('role','?')}]: {m.get('content','')[:200]}"
-                    for m in recent_messages[-10:]
-                )
-                await self.memory.write(path, f"# {title}\n\n{summary}\n")
-                self.state["day_titled_date"] = today
-                await bus.emit_inner_thought(f"Titled today's conversation: '{title}'", kind="kernel")
-                await bus.emit_memory_update(path, "write")
-            except Exception as e:
-                await bus.emit_inner_thought(f"Day titling failed: {e}", kind="kernel")
+    async def _get_memory_index(self) -> str:
+        files = self.memory.list_files("")
+        lines = []
+        for entry in files:
+            if entry["type"] == "folder":
+                for s in self.memory.list_files(entry["path"]):
+                    if s["type"] == "file":
+                        lines.append(f"{s['path']} ({s['size']}b)")
+            else:
+                lines.append(f"{entry['path']} ({entry['size']}b)")
+        return "\n".join(lines[:30])
